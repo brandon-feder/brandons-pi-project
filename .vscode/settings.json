@@ -42,6 +42,9 @@
         "ctime": "cpp",
         "list": "cpp",
         "fstream": "cpp",
-        "ratio": "cpp"
-    }
+        "ratio": "cpp",
+        "map": "cpp"
+    },
+    "C_Cpp.intelliSenseEngineFallback": "enabled",
+    "C_Cpp.errorSquiggles": "enabled"
 }
