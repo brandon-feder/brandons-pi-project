@@ -15,10 +15,10 @@ using namespace std;
 #define MAX_COMPLETION_TRIES 3
 
 #define OP_READ 0
-#define OP_WRITE 0
+#define OP_WRITE 1
 
 // TODO: Look into using unique_pointer for sub data
-class ChunkyFIOHandler
+class ChunkyFIO
 {
 private:
     struct SubData
@@ -59,7 +59,7 @@ private:
     void free_buf_section(const uint32_t chunk_id);
 public:
     // Uses sequential `n_files_per_chunk_` files as chunks 
-    ChunkyFIOHandler(
+    ChunkyFIO(
         int *const fds_,
         const uint32_t n_files,
         const size_t file_size_,
@@ -67,7 +67,7 @@ public:
         uint8_t *const buf,
         size_t buf_size);
 
-    ~ChunkyFIOHandler();
+    ~ChunkyFIO();
 
     uint8_t *const assign_buf_section(const uint32_t chunk_id);
     void queue_read(const uint32_t chunk_id);

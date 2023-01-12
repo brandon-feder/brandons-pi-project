@@ -20,7 +20,8 @@ def create_mode(name, *drives, bs=65536):
     pvcreate -a {drives_str}
     vgcreate vg_{name} {drives_str}
     lvcreate -n lv_{name} -l 100%FREE vg_{name}
-    mkfs.xfs /dev/vg_{name}/lv_{name}
+    mkfs.xfs -d su=64k,sw=4 /dev/vg_{name}/lv_{name}
+    udevadm settle
     """
 
     run(cmds)

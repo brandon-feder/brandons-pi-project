@@ -1,28 +1,28 @@
 #include "chunky-fio.h"
 #include "debug.h"
 
-inline uint8_t *const ChunkyFIOHandler::nth_buf_section(uint32_t n)
+inline uint8_t *const ChunkyFIO::nth_buf_section(uint32_t n)
 { return buf + n*chunk_size; }
 
-inline const uint32_t ChunkyFIOHandler::nth_buf_section_indx(uint32_t n)
-{ return n*chunk_size; }
+inline const uint32_t ChunkyFIO::nth_buf_section_indx(uint32_t n)
+{ return n*n_files_per_chunk; }
 
-inline const int ChunkyFIOHandler::nth_chunk_first_file(uint32_t chunk)
+inline const int ChunkyFIO::nth_chunk_first_file(uint32_t chunk)
 { return chunk*n_files_per_chunk; }
 
-inline uint8_t *const ChunkyFIOHandler::chunks_buf_section(uint32_t chunk_id)
+inline uint8_t *const ChunkyFIO::chunks_buf_section(uint32_t chunk_id)
 { return nth_buf_section(chunk_to_buf_section[chunk_id]); }
 
-inline const uint32_t ChunkyFIOHandler::chunks_buf_section_indx(uint32_t chunk_id)
+inline const uint32_t ChunkyFIO::chunks_buf_section_indx(uint32_t chunk_id)
 { return nth_buf_section_indx(chunk_to_buf_section[chunk_id]); }
 
-void ChunkyFIOHandler::free_buf_section(const uint32_t chunk_id)
+void ChunkyFIO::free_buf_section(const uint32_t chunk_id)
 {
     is_buf_section_free[chunk_to_buf_section[chunk_id]] = true;
     chunk_to_buf_section.erase(chunk_id);
 }
 
-const uint32_t ChunkyFIOHandler::wait_for_completion()
+const uint32_t ChunkyFIO::wait_for_completion()
 {
     typedef list<uint32_t>::iterator u32_iter;
     
@@ -33,22 +33,27 @@ const uint32_t ChunkyFIOHandler::wait_for_completion()
     #endif
 
     uint32_t n_cqe;
+    uint32_t min_remaining_section;
     u32_iter chunk, min_remaining_chunk;
     io_uring_cqe *cqe;
 
     while(1) {
         // Get the minimum remaining
         min_remaining_chunk = chunk_marked_done.begin();
+        min_remaining_section = chunk_to_buf_section[*min_remaining_chunk];
 
         for(chunk = chunk_marked_done.begin(); 
             chunk != chunk_marked_done.end(); 
             ++chunk) {
 
-            if(remaining[*chunk] < remaining[*min_remaining_chunk])
+            if(remaining[chunk_to_buf_section[*chunk]] < remaining[min_remaining_section])
+            {
                 min_remaining_chunk = chunk;
+                min_remaining_section = chunk_to_buf_section[*chunk];
+            }
         }
 
-        n_cqe = remaining[*min_remaining_chunk];
+        n_cqe = remaining[min_remaining_section];
 
         // If it has 0 remaining e.g. it is done, return it
         if(n_cqe == 0)
@@ -59,8 +64,6 @@ const uint32_t ChunkyFIOHandler::wait_for_completion()
             return b_sec;
         }
 
-        printf("%s n_cqe: %u\n", INF, n_cqe);
-
         for(uint32_t i = 0; i < n_cqe; ++i)
         {
             int ret = io_uring_wait_cqe(&ring, &cqe);
@@ -70,9 +73,12 @@ const uint32_t ChunkyFIOHandler::wait_for_completion()
                 ));
 
             if (cqe->res < 0)
-                throw runtime_error(string("io_uring submission failed:") + strerror(-cqe->res));
+                throw runtime_error(string("io_uring submission failed: ") + strerror(-cqe->res));
+            else if(cqe->res != file_size)
+                throw runtime_error("Partial completions not supported\n");
 
             SubData *s_data = (SubData *)io_uring_cqe_get_data(cqe);
+            
             remaining[s_data->buf_section_indx]--;
             io_uring_cqe_seen(&ring, cqe);
             delete s_data;
@@ -80,7 +86,7 @@ const uint32_t ChunkyFIOHandler::wait_for_completion()
     }
 }
 
-ChunkyFIOHandler::ChunkyFIOHandler(
+ChunkyFIO::ChunkyFIO(
     int *fds_,
     uint32_t n_files_,
     size_t file_size_,
@@ -125,7 +131,7 @@ is_buf_section_free(new bool[n_buf_sections])
         buf_vec[i].iov_len = file_size;
         buf_ptr += file_size;
     }
-    r = io_uring_register_buffers(&ring, buf_vec, n_buf_sections);
+    r = io_uring_register_buffers(&ring, buf_vec, n_buf_sections*n_files_per_chunk);
     delete buf_vec;
     if(r < 0) throw runtime_error(string("Could not register buffers: ")+strerror(-r));
 
@@ -138,7 +144,7 @@ is_buf_section_free(new bool[n_buf_sections])
         remaining[i] = 0;
 }
 
-ChunkyFIOHandler::~ChunkyFIOHandler()
+ChunkyFIO::~ChunkyFIO()
 {
     io_uring_unregister_files(&ring);
     io_uring_unregister_buffers(&ring);
@@ -147,7 +153,7 @@ ChunkyFIOHandler::~ChunkyFIOHandler()
     delete is_buf_section_free;
 }
 
-uint8_t *const ChunkyFIOHandler::assign_buf_section(const uint32_t chunk_id)
+uint8_t *const ChunkyFIO::assign_buf_section(const uint32_t chunk_id)
 {
     // Try to find a free buf section
     for(uint32_t i = 0; i < n_buf_sections; ++i)
@@ -168,14 +174,14 @@ uint8_t *const ChunkyFIOHandler::assign_buf_section(const uint32_t chunk_id)
     return nth_buf_section(bsec_indx);
 }
 
-void ChunkyFIOHandler::submit_sqe(SubData *s_data)
+void ChunkyFIO::submit_sqe(SubData *s_data)
 {
+    io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if(!sqe)
+        throw runtime_error("Could not get submission queue.");
+
     if(s_data->op == OP_READ)
     {
-        io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-        if(!sqe)
-            throw runtime_error("Could not get submission queue.");
-        
         io_uring_prep_read_fixed(
             sqe, 
             s_data->fd, 
@@ -185,10 +191,6 @@ void ChunkyFIOHandler::submit_sqe(SubData *s_data)
         io_uring_sqe_set_data(sqe, (void *)s_data);
     } else if(s_data->op == OP_WRITE)
     {
-        io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-        if(!sqe)
-            throw runtime_error("Could not get submission queue.");
-        
         io_uring_prep_write_fixed(
             sqe, 
             s_data->fd, 
@@ -199,7 +201,7 @@ void ChunkyFIOHandler::submit_sqe(SubData *s_data)
     }
 }
 
-void ChunkyFIOHandler::queue_read(const uint32_t chunk_id)
+void ChunkyFIO::queue_read(const uint32_t chunk_id)
 {
     int fd = nth_chunk_first_file(chunk_id);
     uint8_t *buf_ptr = chunks_buf_section(chunk_id);
@@ -229,7 +231,7 @@ void ChunkyFIOHandler::queue_read(const uint32_t chunk_id)
             strerror(-errno)));
 }
 
-void ChunkyFIOHandler::queue_write(const uint32_t chunk_id)
+void ChunkyFIO::queue_write(const uint32_t chunk_id)
 {
     int fd = nth_chunk_first_file(chunk_id);
     uint8_t *buf_ptr = chunks_buf_section(chunk_id);
@@ -246,22 +248,24 @@ void ChunkyFIOHandler::queue_write(const uint32_t chunk_id)
         s_data->op = OP_WRITE;
         s_data->buf_section_indx = chunk_to_buf_section[chunk_id];
 
-        printf("%s s_data->buf_indx: %lu\n", INF, s_data->buf_indx);
         submit_sqe(s_data);
 
         ++fd; ++buf_indx;
         buf_ptr += file_size;
     }
 
-    remaining[chunk_to_buf_section[chunk_id]] += n_files_per_chunk;
-    int r = io_uring_submit(&ring);
-    if(r < 0)
-        throw runtime_error(str_fprintf(
-            "Could not submit new writes to io_uring: %s", 
-            strerror(-errno)));
+    remaining[chunk_to_buf_section[chunk_id]] = n_files_per_chunk;
+    int r = 1;
+    while(r > 0) {
+        r = io_uring_submit(&ring);
+        if(r < 0)
+            throw runtime_error(str_fprintf(
+                "Could not submit new writes to io_uring: %s", 
+                strerror(-errno)));
+    }
 }
 
-void ChunkyFIOHandler::mark_done(const uint32_t chunk_id)
+void ChunkyFIO::mark_done(const uint32_t chunk_id)
 { 
     if(chunk_to_buf_section.find(chunk_id) == chunk_to_buf_section.end())
         throw runtime_error("The chunk_id marked for completion is not assigned to a buffer section.");
@@ -269,19 +273,20 @@ void ChunkyFIOHandler::mark_done(const uint32_t chunk_id)
         chunk_marked_done.push_back(chunk_id); 
 }
 
-void ChunkyFIOHandler::print_chunk_buf_sections()
+void ChunkyFIO::print_chunk_buf_sections()
 {
     map<uint32_t, uint32_t>::iterator i = chunk_to_buf_section.begin();
 
-    printf("%s chunk, buf section, marked done\n", INF);
+    printf("%s chunk, buf section, marked done, buffer start\n", INF);
     for(; i != chunk_to_buf_section.end(); ++i)
-        printf("%s %d,     %d,           %s\n", 
+        printf("%s %d,     %d,           %s,        %lu\n", 
             TAB, (*i).first, 
             (*i).second,
             find(
                 chunk_marked_done.begin(), 
                 chunk_marked_done.end(),
                 (*i).first
-            ) != chunk_marked_done.end() ? "yes" : "no"
+            ) != chunk_marked_done.end() ? "yes" : "no",
+            (uint64_t)chunks_buf_section_indx((*i).first)
         );
 }

@@ -1,4 +1,0 @@
-/home/koala/Documents/brandons-pi-project/build/CMakeFiles/BPPLib.dir
-/home/koala/Documents/brandons-pi-project/build/CMakeFiles/Main.dir
-/home/koala/Documents/brandons-pi-project/build/CMakeFiles/edit_cache.dir
-/home/koala/Documents/brandons-pi-project/build/CMakeFiles/rebuild_cache.dir
