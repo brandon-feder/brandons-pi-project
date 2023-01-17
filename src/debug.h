@@ -30,28 +30,8 @@ void test_env_vars(string env_name);
 template<typename T>
 string vec_str(vector<T> vec);
 
-// Returns path object to the nth test file
-filesystem::path nth_test_file_path(uint32_t n);
-
-// Creates directory if it does not exist
-void create_test_dir();
-
-// Creates test file (if it does not exist), sets it's length
-// to at least len bytes (may be longer if already exists),
-// and returns the file. Does not create the directory
-ofstream create_test_file_no_dir(uint32_t n, size_t len);
-
-// Creates nth test file and directory if needed
-ofstream create_test_file(uint32_t n, size_t len);
-
-// Creates test file directory and test files with "index" 
-// 0, 1, ... n-1 all of length at least n. 
-// See create_test_file()
-void create_n_test_files(uint32_t n, size_t len);
-
-// C-Opens (gets fd) the first n test files for reading
-// and writing. They must already be created.
-void c_open_test_files(uint32_t n, int *fds);
+// Creates a file, sets it's size, and returns it's file descriptor
+int create_file_of_size(string path, string fname);
 
 void c_close_files(uint32_t n, int *fds);
 #endif

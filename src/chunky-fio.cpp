@@ -1,5 +1,5 @@
-#include "chunky-fio.h"
 #include "debug.h"
+#include "chunky-fio.h"
 
 inline uint8_t *const ChunkyFIO::nth_buf_section(uint32_t n)
 { return buf + n*chunk_size; }
@@ -116,6 +116,10 @@ is_buf_section_free(new bool[n_buf_sections])
     uint32_t i;
 
     // Setup iouring ring strcture
+    // struct io_uring_params params;
+    // params.flags |= IORING_SETUP_SQPOLL;
+    // params.sq_thread_idle = 2000;
+    // r = io_uring_queue_init_params(n_files_per_chunk, &ring, &params);
     r = io_uring_queue_init(n_files_per_chunk, &ring, 0);
     if(r < 0) throw runtime_error(string("Could not init IOUring queue: ")+strerror(-r));
 
@@ -165,7 +169,7 @@ uint8_t *const ChunkyFIO::assign_buf_section(const uint32_t chunk_id)
 
     // If one is not free, wait for a completion
     uint32_t bsec_indx = wait_for_completion();
-
+    
     is_buf_section_free[bsec_indx] = false;
     chunk_to_buf_section.insert(pair<uint32_t, uint32_t>(
         chunk_id, bsec_indx
@@ -224,6 +228,7 @@ void ChunkyFIO::queue_read(const uint32_t chunk_id)
         buf_ptr += file_size;
     }
 
+    remaining[chunk_to_buf_section[chunk_id]] = n_files_per_chunk;
     int r = io_uring_submit(&ring);
     if(r < 0)
         throw runtime_error(str_fprintf(

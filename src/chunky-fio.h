@@ -53,27 +53,21 @@ private:
     inline const int nth_chunk_first_file(uint32_t chunk);
     inline uint8_t *const chunks_buf_section(uint32_t chunk);
     inline const uint32_t chunks_buf_section_indx(uint32_t chunk);
+    const uint32_t wait_for_completion();
 
     void submit_sqe(SubData *s_data);
-
     void free_buf_section(const uint32_t chunk_id);
+
 public:
-    // Uses sequential `n_files_per_chunk_` files as chunks 
-    ChunkyFIO(
-        int *const fds_,
-        const uint32_t n_files,
-        const size_t file_size_,
-        const uint32_t n_files_per_chunk_,
-        uint8_t *const buf,
-        size_t buf_size);
-
-    ~ChunkyFIO();
-
+    // Uses sequential `n`
+    
+    const uint32_t wait_for_completion();
     uint8_t *const assign_buf_section(const uint32_t chunk_id);
     void queue_read(const uint32_t chunk_id);
     void queue_write(const uint32_t chunk_id);
     void mark_done(const uint32_t chunk_id);
-    const uint32_t wait_for_completion();
+    
+    void complete_chunk(uint32_t chunk_id);
     
     // For debugging
     void print_chunk_buf_sections();
