@@ -13,6 +13,8 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 
 using namespace std;
 
@@ -24,14 +26,14 @@ using namespace std;
 
 const char *const TEST_DIR_PATH = getenv("BPP_TEST_DIR_PATH");
 
-string str_fprintf(const char *format, ...);
+string str_fprintf(const char *format, ...); 
 void test_env_vars(string env_name);
+off_t get_file_size(int fd);
 
 template<typename T>
-string vec_str(vector<T> vec);
+string vec_to_str(vector<T> vec);
 
-// Creates a file, sets it's size, and returns it's file descriptor
-int create_file_of_size(string path, string fname);
+#define __DEBUG_DEFS__
+#include "debug.cpp"
 
-void c_close_files(uint32_t n, int *fds);
 #endif

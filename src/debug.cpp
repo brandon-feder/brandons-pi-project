@@ -1,6 +1,5 @@
+#ifndef __DEBUG_DEFS__
 #include "debug.h"
-
-using namespace std;
 
 string str_fprintf(const char *format, ...)
 {
@@ -20,8 +19,36 @@ void test_env_vars(string env_name)
             ERR, env_name.c_str()));
 }
 
+off_t get_file_size(int fd) {
+    struct stat st;
+
+    if (fstat(fd, &st) < 0 )
+        throw runtime_error(str_fprintf(
+            "Could not get file stats: %s",
+            strerror(errno)
+        ));
+
+    if(S_ISREG(st.st_mode)) {
+        return st.st_size;
+    } else if (S_ISBLK(st.st_mode)) {
+        unsigned long long bytes;
+
+        if (ioctl(fd, BLKGETSIZE64, &bytes) != 0)
+            throw runtime_error(str_fprintf(
+                "Could not get block device size: %s",
+                strerror(errno)
+            ));
+
+        return bytes;
+    }
+    
+    throw runtime_error(str_fprintf("Could not get device size %s"));
+}
+
+#else 
+
 template<typename T>
-string vec_str(vector<T> vec)
+string vec_to_str(vector<T> vec)
 {
     if(vec.size() == 0) return "[]";
     else
@@ -35,3 +62,5 @@ string vec_str(vector<T> vec)
         return ss.str();
     }
 }
+
+#endif

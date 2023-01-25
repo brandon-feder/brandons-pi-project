@@ -1,297 +1,172 @@
-#include "debug.h"
 #include "chunky-fio.h"
 
-inline uint8_t *const ChunkyFIO::nth_buf_section(uint32_t n)
-{ return buf + n*chunk_size; }
-
-inline const uint32_t ChunkyFIO::nth_buf_section_indx(uint32_t n)
-{ return n*n_files_per_chunk; }
-
-inline const int ChunkyFIO::nth_chunk_first_file(uint32_t chunk)
-{ return chunk*n_files_per_chunk; }
-
-inline uint8_t *const ChunkyFIO::chunks_buf_section(uint32_t chunk_id)
-{ return nth_buf_section(chunk_to_buf_section[chunk_id]); }
-
-inline const uint32_t ChunkyFIO::chunks_buf_section_indx(uint32_t chunk_id)
-{ return nth_buf_section_indx(chunk_to_buf_section[chunk_id]); }
-
-void ChunkyFIO::free_buf_section(const uint32_t chunk_id)
+void ChunkyFIO::toggle_sec_stat(void *ptr)
 {
-    is_buf_section_free[chunk_to_buf_section[chunk_id]] = true;
-    chunk_to_buf_section.erase(chunk_id);
+    sec_stat_mut.lock();
+    if(sec_statuses[STATUS_RESERVED].count(ptr) == 1) {
+        sec_statuses[STATUS_RESERVED].erase(ptr);
+        sec_statuses[STATUS_UNRESERVED].insert(ptr);
+    } else {
+        sec_statuses[STATUS_UNRESERVED].erase(ptr);
+        sec_statuses[STATUS_RESERVED].insert(ptr);
+    }
+    sec_stat_mut.unlock();
 }
 
-const uint32_t ChunkyFIO::wait_for_completion()
+void *ChunkyFIO::wait_reserve_sec()
 {
-    typedef list<uint32_t>::iterator u32_iter;
-    
-    // Make sure there is at least one chunk marked done
-    #if CHUNKY_FIO_DEBUG_MODE
-        if(chunk_marked_done.size() == 0)
-            throw runtime_error("No chunks are marked done!");
-    #endif
+    sec_stat_mut.lock();
 
-    uint32_t n_cqe;
-    uint32_t min_remaining_section;
-    u32_iter chunk, min_remaining_chunk;
-    io_uring_cqe *cqe;
-
-    while(1) {
-        // Get the minimum remaining
-        min_remaining_chunk = chunk_marked_done.begin();
-        min_remaining_section = chunk_to_buf_section[*min_remaining_chunk];
-
-        for(chunk = chunk_marked_done.begin(); 
-            chunk != chunk_marked_done.end(); 
-            ++chunk) {
-
-            if(remaining[chunk_to_buf_section[*chunk]] < remaining[min_remaining_section])
-            {
-                min_remaining_chunk = chunk;
-                min_remaining_section = chunk_to_buf_section[*chunk];
-            }
-        }
-
-        n_cqe = remaining[min_remaining_section];
-
-        // If it has 0 remaining e.g. it is done, return it
-        if(n_cqe == 0)
-        {
-            uint32_t b_sec = chunk_to_buf_section[*min_remaining_chunk];
-            free_buf_section(*min_remaining_chunk);
-            chunk_marked_done.erase(min_remaining_chunk);
-            return b_sec;
-        }
-
-        for(uint32_t i = 0; i < n_cqe; ++i)
-        {
-            int ret = io_uring_wait_cqe(&ring, &cqe);
-            if(ret < 0)
-                throw runtime_error(str_fprintf(
-                    "io_uring_wait_cqe failed: %s", strerror(-ret)
-                ));
-
-            if (cqe->res < 0)
-                throw runtime_error(string("io_uring submission failed: ") + strerror(-cqe->res));
-            else if(cqe->res != file_size)
-                throw runtime_error("Partial completions not supported\n");
-
-            SubData *s_data = (SubData *)io_uring_cqe_get_data(cqe);
-            
-            remaining[s_data->buf_section_indx]--;
-            io_uring_cqe_seen(&ring, cqe);
-            delete s_data;
-        }
+    // If waiting will hang forever, throw error
+    if(sec_statuses[STATUS_UNRESERVED].size() == 0) {
+        sec_stat_mut.unlock();
+        throw runtime_error("No sections are marked unreserved.");
     }
+
+    // wait for an unreserved section to be ready for reservation
+    uint64_t i = 0;
+    vector<uint64_t> jobs;
+    jobs.resize(sec_statuses[STATUS_UNRESERVED].size());
+    for(auto sec : sec_statuses[STATUS_UNRESERVED]) {
+        jobs[i] = sec_id_frwd[sec];
+        ++i;
+    }
+    sec_stat_mut.unlock();
+    uint64_t sub_id = thread_pool.wait_for_any(jobs);
+
+    // get the sections pointer
+    void *res = sec_id_bkwd[sub_id];
+
+    // mark it as reserved
+    toggle_sec_stat(res);
+
+    return res;
 }
 
 ChunkyFIO::ChunkyFIO(
-    int *fds_,
-    uint32_t n_files_,
-    size_t file_size_,
-    uint32_t n_files_per_chunk_,
-    uint8_t *buf_,
-    size_t buf_size) :
-n_chunks(n_files_/n_files_per_chunk_),
-n_files_per_chunk(n_files_per_chunk_),
-n_files(n_files_),
-file_size(file_size_),
-chunk_size(file_size*n_files_per_chunk_),
-n_buf_sections(buf_size/chunk_size),
-buf(buf_),
-remaining(new uint32_t[n_buf_sections]),
+    uint64_t n_threads_, vector<int> fds_, 
+    uint64_t n_chunks_, uint64_t chunks_at_once_,
+    uint64_t n_blocks_per_chunk_, size_t block_size_,
+    function<pair<int, off_t>(uint64_t)> block_loc_
+) :
+n_threads(n_threads_),
 fds(fds_),
-is_buf_section_free(new bool[n_buf_sections])
+n_chunks(n_chunks_),
+chunks_at_once(chunks_at_once_),
+n_blocks_per_chunk(n_blocks_per_chunk_),
+block_size(block_size_),
+block_loc(block_loc_),
+chunk_size(block_size*n_blocks_per_chunk),
+thread_pool(ThreadPool(n_threads))
 {
-    // Check parameters
-    if(n_files == 0 || file_size == 0 || n_files_per_chunk_ == 0)
-        throw invalid_argument("n_files, file_size, and n_files_per_chunk_ must be greater than 0");
-    if(n_buf_sections == 0)
-        throw invalid_argument("Not enough space in the buffer for even a single section.");
-    if(file_size >= 0x40000000) // For buffer to work with io_uring
-        throw invalid_argument("file_size must be less than 1073741824 bytes.");
-
-    int r;
-    uint32_t i;
-
-    // Setup iouring ring strcture
-    // struct io_uring_params params;
-    // params.flags |= IORING_SETUP_SQPOLL;
-    // params.sq_thread_idle = 2000;
-    // r = io_uring_queue_init_params(n_files_per_chunk, &ring, &params);
-    r = io_uring_queue_init(n_files_per_chunk, &ring, 0);
-    if(r < 0) throw runtime_error(string("Could not init IOUring queue: ")+strerror(-r));
-
-    // Register files
-    r = io_uring_register_files(&ring, fds, n_files);
-    if(r < 0) throw runtime_error(string("Could not register files: ")+strerror(-r));
-    
-    // Register buffers
-    iovec *buf_vec = new iovec[n_buf_sections*n_files_per_chunk];
-    uint8_t *buf_ptr = buf;
-    for(i = 0; i < n_buf_sections*n_files_per_chunk; ++i) {
-        buf_vec[i].iov_base = (void *)buf_ptr;
-        buf_vec[i].iov_len = file_size;
-        buf_ptr += file_size;
-    }
-    r = io_uring_register_buffers(&ring, buf_vec, n_buf_sections*n_files_per_chunk);
-    delete buf_vec;
-    if(r < 0) throw runtime_error(string("Could not register buffers: ")+strerror(-r));
-
-    // Mark all buffer sections as free
-    for(i = 0; i < n_buf_sections; ++i)
-        is_buf_section_free[i] = true;
-
-    // Set the remaining to 0
-    for(i = 0; i < n_buf_sections; ++i)
-        remaining[i] = 0;
-}
-
-ChunkyFIO::~ChunkyFIO()
-{
-    io_uring_unregister_files(&ring);
-    io_uring_unregister_buffers(&ring);
-    io_uring_queue_exit(&ring);
-    delete remaining;
-    delete is_buf_section_free;
-}
-
-uint8_t *const ChunkyFIO::assign_buf_section(const uint32_t chunk_id)
-{
-    // Try to find a free buf section
-    for(uint32_t i = 0; i < n_buf_sections; ++i)
-        if(is_buf_section_free[i]) {
-            is_buf_section_free[i] = false;
-            chunk_to_buf_section.insert(pair<uint32_t, uint32_t>(chunk_id, i));
-            return nth_buf_section(i);
-        }
-
-    // If one is not free, wait for a completion
-    uint32_t bsec_indx = wait_for_completion();
-    
-    is_buf_section_free[bsec_indx] = false;
-    chunk_to_buf_section.insert(pair<uint32_t, uint32_t>(
-        chunk_id, bsec_indx
-    ));
-
-    return nth_buf_section(bsec_indx);
-}
-
-void ChunkyFIO::submit_sqe(SubData *s_data)
-{
-    io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    if(!sqe)
-        throw runtime_error("Could not get submission queue.");
-
-    if(s_data->op == OP_READ)
-    {
-        io_uring_prep_read_fixed(
-            sqe, 
-            s_data->fd, 
-            (void *)s_data->buf, s_data->len, 
-            0, s_data->buf_indx);
-        io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-        io_uring_sqe_set_data(sqe, (void *)s_data);
-    } else if(s_data->op == OP_WRITE)
-    {
-        io_uring_prep_write_fixed(
-            sqe, 
-            s_data->fd, 
-            (void *)s_data->buf, s_data->len, 
-            0, s_data->buf_indx);
-        io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
-        io_uring_sqe_set_data(sqe, (void *)s_data);
-    }
-}
-
-void ChunkyFIO::queue_read(const uint32_t chunk_id)
-{
-    int fd = nth_chunk_first_file(chunk_id);
-    uint8_t *buf_ptr = chunks_buf_section(chunk_id);
-    uint32_t buf_indx = chunks_buf_section_indx(chunk_id);
-
-    for(uint32_t i = 0; i < n_files_per_chunk; ++i)
-    {
-        SubData *s_data = new SubData;
-        s_data->tries = MAX_COMPLETION_TRIES;
-        s_data->len = file_size;
-        s_data->fd = fd;
-        s_data->buf = buf_ptr;
-        s_data->buf_indx = buf_indx;
-        s_data->op = OP_READ;
-        s_data->buf_section_indx = chunk_to_buf_section[chunk_id];
-
-        submit_sqe(s_data);
-
-        ++fd; ++buf_indx;
-        buf_ptr += file_size;
-    }
-
-    remaining[chunk_to_buf_section[chunk_id]] = n_files_per_chunk;
-    int r = io_uring_submit(&ring);
-    if(r < 0)
-        throw runtime_error(str_fprintf(
-            "Could not submit new reads to io_uring: %s", 
-            strerror(-errno)));
-}
-
-void ChunkyFIO::queue_write(const uint32_t chunk_id)
-{
-    int fd = nth_chunk_first_file(chunk_id);
-    uint8_t *buf_ptr = chunks_buf_section(chunk_id);
-    uint32_t buf_indx = chunks_buf_section_indx(chunk_id);
-
-    for(uint32_t i = 0; i < n_files_per_chunk; ++i)
-    {
-        SubData *s_data = new SubData;
-        s_data->tries = MAX_COMPLETION_TRIES;
-        s_data->len = file_size;
-        s_data->fd = fd;
-        s_data->buf = buf_ptr;
-        s_data->buf_indx = buf_indx;
-        s_data->op = OP_WRITE;
-        s_data->buf_section_indx = chunk_to_buf_section[chunk_id];
-
-        submit_sqe(s_data);
-
-        ++fd; ++buf_indx;
-        buf_ptr += file_size;
-    }
-
-    remaining[chunk_to_buf_section[chunk_id]] = n_files_per_chunk;
-    int r = 1;
-    while(r > 0) {
-        r = io_uring_submit(&ring);
-        if(r < 0)
-            throw runtime_error(str_fprintf(
-                "Could not submit new writes to io_uring: %s", 
-                strerror(-errno)));
-    }
-}
-
-void ChunkyFIO::mark_done(const uint32_t chunk_id)
-{ 
-    if(chunk_to_buf_section.find(chunk_id) == chunk_to_buf_section.end())
-        throw runtime_error("The chunk_id marked for completion is not assigned to a buffer section.");
-    else
-        chunk_marked_done.push_back(chunk_id); 
-}
-
-void ChunkyFIO::print_chunk_buf_sections()
-{
-    map<uint32_t, uint32_t>::iterator i = chunk_to_buf_section.begin();
-
-    printf("%s chunk, buf section, marked done, buffer start\n", INF);
-    for(; i != chunk_to_buf_section.end(); ++i)
-        printf("%s %d,     %d,           %s,        %lu\n", 
-            TAB, (*i).first, 
-            (*i).second,
-            find(
-                chunk_marked_done.begin(), 
-                chunk_marked_done.end(),
-                (*i).first
-            ) != chunk_marked_done.end() ? "yes" : "no",
-            (uint64_t)chunks_buf_section_indx((*i).first)
+    // reserve areas of virtual mem to use for mem-maping
+    void *addr;
+    for(uint64_t i = 0; i < chunks_at_once; ++i) {
+        addr = mmap(NULL, block_size*n_blocks_per_chunk, 
+            PROT_WRITE | PROT_READ, 
+            MAP_PRIVATE | MAP_ANONYMOUS, 
+            -1, 0
         );
+
+        if(addr == MAP_FAILED)
+            throw runtime_error(str_fprintf(
+                "mmap failed: %s",
+                strerror(errno)
+            ));
+
+        printf("%s start, end: %lu, %lu\n", 
+            INF,
+            (uint64_t)addr, 
+            (uint64_t)((uint8_t *)addr + block_size*n_blocks_per_chunk)
+        );
+
+
+        sec_statuses[STATUS_UNRESERVED].insert(addr);
+        sec_id_frwd[addr] = i;
+        sec_id_bkwd[i] = addr;
+    }
+}
+
+ChunkyFIO::~ChunkyFIO() 
+{
+    thread_pool.complete_all();
+
+    // unmap all reserved areas of virtual memory
+    for(auto sec : sec_id_bkwd)
+        munmap(sec.second, chunk_size);
+}
+
+void ChunkyFIO::map_chunk(uint64_t chunk_id)
+{
+    // get the part of virtual-memory that the chunk can use
+    void *sec = wait_reserve_sec();
+
+    // assign section to that chunk
+    chunk_sec_mut.lock();
+    chunk_to_sec[chunk_id] = sec; 
+    chunk_sec_mut.unlock();
+
+    // for every block in the chunk
+    for(uint64_t i = 0; i < n_blocks_per_chunk; ++i) {
+        // get the blocks file descriptor and offset
+        uint64_t block_id = chunk_id*n_blocks_per_chunk + i;
+        pair<int, uint64_t> block = block_loc(block_id);
+        int fd = block.first;
+        off_t offset = block.second*block_size;
+
+        // queue the block's memory mapping
+        madvise(sec, chunk_size, MADV_SEQUENTIAL | MADV_WILLNEED );
+        thread_pool.submit([=, this](void *data) {
+            void *ptr = mmap(
+                (void *)((uint8_t *)sec + i*block_size), block_size, 
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_FIXED | MAP_POPULATE,
+                fd, offset
+            );
+
+            if(ptr == MAP_FAILED)
+                throw runtime_error(
+                    str_fprintf("mmap failed: %s", strerror(errno))
+                );
+        }, NULL, sec_id_frwd[sec]);
+    }
+}
+
+void ChunkyFIO::unmap_chunk(uint64_t chunk_id)
+{
+    if(chunk_id >= n_chunks)
+        throw runtime_error("Invalid chunk id.");
+
+    // get the chunks mem-mapped section
+    chunk_sec_mut.lock();
+    void *sec = chunk_to_sec[chunk_id];
+    chunk_sec_mut.unlock();
+
+    // queue each block to be synced
+    // thread_pool.submit([=, this](void *data) {
+    //     for(uint64_t i = 0; i < n_blocks_per_chunk; ++i) {
+    //         msync((void *)((uint8_t *)sec + i*block_size), block_size, MS_SYNC);
+    //     }
+    // }, NULL, sec_id_frwd[sec]); // only first 52-bits are in use for memory addr.
+
+    toggle_sec_stat(sec);
+}
+
+void *ChunkyFIO::wait_for_map(uint64_t chunk_id)
+{
+    // get the chunks section
+    chunk_sec_mut.lock();
+    void *sec = chunk_to_sec[chunk_id];
+    chunk_sec_mut.unlock();
+
+    // wait for jobs
+    vector<uint64_t> jobs = {sec_id_frwd[sec]};
+    thread_pool.wait_for_any(jobs);
+
+    return sec;
+}
+
+void ChunkyFIO::wait_all()
+{
+    thread_pool.complete_all();
 }

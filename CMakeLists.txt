@@ -4,11 +4,12 @@ project(BrandonsPiProgram LANGUAGES CXX)
 
 # enable_language(CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(BPPLib "")
 target_sources(BPPLib PRIVATE
+    src/thread-pool.cpp
     src/moduli-set.cpp
     src/residue-int.cpp
     src/chunky-fio.cpp
@@ -22,8 +23,8 @@ target_include_directories(BPPLib PRIVATE src)
 # set_target_properties(BPPLib PROPERTIES CUDA_ARCHITECTURES "61")
 
 # add_executable(Main src/main.cpp)
-add_executable(Main tests/test-chunky-fio.cpp)
+add_executable(Main tests/test-io-speeds.cpp)
 include_directories(src)
 # set_property(TARGET Main PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(Main PRIVATE BPPLib m uring)
+target_link_libraries(Main PRIVATE BPPLib m)
 # set_target_properties(Main PROPERTIES CUDA_ARCHITECTURES "61")
